@@ -9,6 +9,8 @@ import { getWaterMainsData, saveWaterMainsData } from '../data/waterMainsData'
 import { usePanelContext } from '../contexts/PanelContext'
 import PressureSensorTooltip from './tooltips/PressureSensorTooltip'
 
+const MAPTILER_API_KEY = 'X1kjwlVN29N1UZItdixx'
+
 // Helper function to get color for meter status
 function getStatusColor(status) {
   switch(status) {
@@ -163,7 +165,7 @@ export default function MapView() {
 
     map.current = new maplibregl.Map({
       container: mapContainer.current,
-      style: `https://api.maptiler.com/maps/streets-v2-dark/style.json?key=${import.meta.env.VITE_MAPTILER_API_KEY}`,
+      style: `https://api.maptiler.com/maps/streets-v2-dark/style.json?key=${MAPTILER_API_KEY}`,
       center: [-90.1994, 38.6270], // St. Louis, MO
       zoom: 11,
       minZoom: 8,
