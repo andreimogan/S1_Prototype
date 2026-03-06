@@ -1,0 +1,7 @@
+install-dependencies: completed
+create-pipe-data: completed
+update-context: completed
+add-map-layers: completed
+update-layer-panel: completed
+add-interactions: completed
+test-integration: in_progress
