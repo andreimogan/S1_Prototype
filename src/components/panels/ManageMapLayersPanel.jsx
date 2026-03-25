@@ -10,11 +10,9 @@ import {
   MousePointer,
   MousePointerClick,
   Trash2,
-  Edit3,
 } from 'lucide-react'
 import { usePanelContext } from '../../contexts/PanelContext'
 import { useDraggable } from '../../hooks/useDraggable'
-import { getNeighborhoodRiskData } from '../../data/neighborhoodRiskData'
 import { getWaterMainsData } from '../../data/waterMainsData'
 
 const categories = [
@@ -107,12 +105,8 @@ const categories = [
           ]
         }
       },
-      { id: 'city-blocks-risk', name: 'City Blocks | Risk', active: false, expanded: false },
-      { id: 'city-blocks-complaints', name: 'City Blocks | Complaint Counts', active: false, expanded: false },
-      { id: 'city-blocks-top', name: 'City Blocks | Top Complaints', active: false, expanded: false },
     ]
   },
-  { id: 'risk', name: 'Risk / Health', activeCount: 0, layers: [] },
 ]
 
 export default function ManageMapLayersPanel() {
@@ -153,17 +147,10 @@ export default function ManageMapLayersPanel() {
     setPressureZoneEditMode,
     neighborhoodsRiskVisible,
     setNeighborhoodsRiskVisible,
-    neighborhoodRiskDrawMode,
-    setNeighborhoodRiskDrawMode,
-    neighborhoodRiskDrawLevel,
-    setNeighborhoodRiskDrawLevel,
-    requestCompleteNeighborhoodRiskPolygon,
-    neighborhoodDrawPointCount,
-    neighborhoodRiskEditMode,
-    setNeighborhoodRiskEditMode,
-    selectedNeighborhoodRiskPolygonId,
-    setSelectedNeighborhoodRiskPolygonId,
-    requestDeleteNeighborhoodRiskPolygon,
+    enabledStlNeighborhoodIds,
+    setEnabledStlNeighborhoodIds,
+    stlNeighborhoodsLoadStatus,
+    stlNeighborhoodList,
     burstGradientParams,
     updateBurstGradientParams
   } = usePanelContext()
@@ -189,46 +176,17 @@ export default function ManageMapLayersPanel() {
   }, [layersVisible, setPosition])
   const [showActiveList, setShowActiveList] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
-  const [expandedCategories, setExpandedCategories] = useState({ boundaries: true, sensors: true, events: true })
-  const [expandedLayers, setExpandedLayers] = useState({ 'pressure-zones': true, 'pressure-sensors': true, 'pressure-sensors-map': true, 'burst-events': true })
-  const [neighborhoodPolygons, setNeighborhoodPolygons] = useState([])
-  const [deletePolygonId, setDeletePolygonId] = useState(null)
+  const [expandedCategories, setExpandedCategories] = useState({ boundaries: false, sensors: false, events: false, assets: false })
+  const [expandedLayers, setExpandedLayers] = useState({})
+  const [stlNeighborhoodSearch, setStlNeighborhoodSearch] = useState('')
   const [layerStates, setLayerStates] = useState({
     'burst-events': burstEventsVisible,
     'pressure-zones': pressureZonesVisible,
     'pressure-sensors': pressureSensorsVisible,
     'pressure-sensors-map': pressureSensorsMapVisible,
-    'neighborhoods-risk': false,
+    'neighborhoods-risk': neighborhoodsRiskVisible,
     'water-mains': false,
-    'city-blocks-risk': false,
-    'city-blocks-complaints': false,
-    'city-blocks-top': false,
   })
-  
-  // Load neighborhood polygons when layer is expanded
-  useEffect(() => {
-    if (expandedLayers['neighborhoods-risk']) {
-      const data = getNeighborhoodRiskData()
-      setNeighborhoodPolygons(data.features || [])
-    }
-  }, [expandedLayers])
-  
-  // Refresh polygon list when draw mode ends
-  useEffect(() => {
-    if (!neighborhoodRiskDrawMode && expandedLayers['neighborhoods-risk']) {
-      const data = getNeighborhoodRiskData()
-      setNeighborhoodPolygons(data.features || [])
-    }
-  }, [neighborhoodRiskDrawMode, expandedLayers])
-  
-  // Refresh polygon list when a delete is requested
-  useEffect(() => {
-    if (deletePolygonId) {
-      const data = getNeighborhoodRiskData()
-      setNeighborhoodPolygons(data.features || [])
-      setDeletePolygonId(null)
-    }
-  }, [deletePolygonId])
   
   const [riskLevelStates, setRiskLevelStates] = useState({
     high: true,
@@ -310,6 +268,13 @@ export default function ManageMapLayersPanel() {
       'pressure-sensors': pressureSensorsVisible
     }))
   }, [pressureSensorsVisible])
+
+  useEffect(() => {
+    setLayerStates(prev => ({
+      ...prev,
+      'neighborhoods-risk': neighborhoodsRiskVisible
+    }))
+  }, [neighborhoodsRiskVisible])
   
   if (!layersVisible) return null
 
@@ -402,6 +367,21 @@ export default function ManageMapLayersPanel() {
       [statusId]: newState
     }))
   }
+
+  const toggleStlNeighborhood = (hoodId) => {
+    if (!neighborhoodsRiskVisible) return
+    setEnabledStlNeighborhoodIds((prev) => {
+      const nextOn = prev[hoodId] === false
+      return {
+        ...prev,
+        [hoodId]: nextOn,
+      }
+    })
+  }
+
+  const filteredStlNeighborhoods = stlNeighborhoodList.filter((hood) =>
+    hood.name.toLowerCase().includes(stlNeighborhoodSearch.toLowerCase())
+  )
   
   return (
     <div
@@ -1236,7 +1216,7 @@ export default function ManageMapLayersPanel() {
                             )}
                           </div>
                         )}
-                        {/* Neighborhoods | Risk: legend and draw controls */}
+                        {/* Neighborhoods | Risk: St. Louis outlines */}
                         {expandedLayers[layer.id] && layer.id === 'neighborhoods-risk' && (
                           <div
                             className="mt-2 rounded-md border px-2.5 py-2"
@@ -1245,150 +1225,82 @@ export default function ManageMapLayersPanel() {
                               backgroundColor: 'rgba(26, 29, 34, 0.6)',
                             }}
                           >
-                            <p className="text-xs font-semibold uppercase tracking-wide" style={{ color: 'var(--color-gray-300)' }}>
-                              Risk Level
-                            </p>
-                            <p className="text-xs leading-snug mb-2" style={{ color: 'var(--color-gray-300)' }}>
-                              Same as Pressure Zones (high / medium / low). Toggle in Pressure Zones applies here too.
-                            </p>
-                            {!neighborhoodRiskDrawMode ? (
-                              <button
-                                type="button"
-                                className="flex h-7 items-center gap-1 rounded-md border px-2 text-xs font-semibold transition-colors w-full justify-center"
+                            <div>
+                              <p className="text-xs font-medium mb-2" style={{ color: 'var(--color-gray-300)' }}>
+                                St. Louis Neighborhood Outlines
+                              </p>
+                              <p className="text-xs mb-2" style={{ color: 'var(--color-gray-400)' }}>
+                                Use the main layer toggle to show/hide all outlines.
+                              </p>
+                              <input
+                                type="text"
+                                value={stlNeighborhoodSearch}
+                                onChange={(e) => setStlNeighborhoodSearch(e.target.value)}
+                                placeholder="Search neighborhoods"
+                                className="w-full h-7 rounded-md border px-2 text-xs mb-2"
                                 style={{
-                                  backgroundColor: 'var(--color-purple-700)',
-                                  color: 'var(--color-purple-100)',
-                                  borderColor: 'var(--color-purple-600)',
+                                  backgroundColor: 'var(--sand-surface)',
+                                  borderColor: 'var(--color-gray-700)',
+                                  color: 'var(--color-gray-100)',
                                 }}
-                                onClick={() => setNeighborhoodRiskDrawMode(true)}
-                                onMouseEnter={(e) => {
-                                  e.currentTarget.style.backgroundColor = 'var(--color-purple-600)'
-                                }}
-                                onMouseLeave={(e) => {
-                                  e.currentTarget.style.backgroundColor = 'var(--color-purple-700)'
-                                }}
-                                title="Click on the map to add polygon vertices, then Complete"
-                              >
-                                Add polygon
-                              </button>
-                            ) : (
-                              <>
-                                <p className="text-xs font-medium mb-1.5" style={{ color: 'var(--color-gray-300)' }}>
-                                  Risk for new polygon
+                              />
+                              {stlNeighborhoodsLoadStatus === 'loading' && (
+                                <p className="text-xs" style={{ color: 'var(--color-gray-400)' }}>Loading neighborhoods...</p>
+                              )}
+                              {stlNeighborhoodsLoadStatus === 'error' && (
+                                <p className="text-xs" style={{ color: 'var(--color-red-400)' }}>
+                                  Could not load neighborhoods from ArcGIS.
                                 </p>
-                                <div className="flex gap-1.5 mb-2">
-                                  {['high', 'medium', 'low'].map((level) => (
-                                    <button
-                                      key={level}
-                                      type="button"
-                                      className="flex-1 px-2 py-1 rounded text-xs font-medium border transition-colors"
-                                      style={{
-                                        backgroundColor: neighborhoodRiskDrawLevel === level ? (level === 'high' ? 'var(--color-red-600)' : level === 'medium' ? 'var(--color-orange-600)' : 'var(--color-green-600)') : 'var(--color-gray-700)',
-                                        color: neighborhoodRiskDrawLevel === level ? 'white' : 'var(--color-gray-300)',
-                                        borderColor: neighborhoodRiskDrawLevel === level ? (level === 'high' ? 'var(--color-red-500)' : level === 'medium' ? 'var(--color-orange-500)' : 'var(--color-green-500)') : 'var(--color-gray-600)',
-                                      }}
-                                      onClick={() => setNeighborhoodRiskDrawLevel(level)}
-                                    >
-                                      {level.charAt(0).toUpperCase() + level.slice(1)}
-                                    </button>
-                                  ))}
-                                </div>
-                                <div className="flex gap-1.5">
-                                  <button
-                                    type="button"
-                                    className="flex-1 h-7 rounded-md border px-2 text-xs font-semibold transition-colors"
-                                    style={{
-                                      backgroundColor: neighborhoodDrawPointCount >= 3 ? 'var(--color-green-700)' : 'var(--color-gray-700)',
-                                      color: neighborhoodDrawPointCount >= 3 ? 'var(--color-green-100)' : 'var(--color-gray-400)',
-                                      borderColor: neighborhoodDrawPointCount >= 3 ? 'var(--color-green-600)' : 'var(--color-gray-600)',
-                                    }}
-                                    onClick={requestCompleteNeighborhoodRiskPolygon}
-                                    disabled={neighborhoodDrawPointCount < 3}
-                                    onMouseEnter={(e) => { if (neighborhoodDrawPointCount >= 3) e.currentTarget.style.backgroundColor = 'var(--color-green-600)' }}
-                                    onMouseLeave={(e) => { if (neighborhoodDrawPointCount >= 3) e.currentTarget.style.backgroundColor = 'var(--color-green-700)' }}
-                                    title={neighborhoodDrawPointCount >= 3 ? 'Close polygon and add' : 'Add at least 3 points on the map'}
-                                  >
-                                    Complete
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="flex-1 h-7 rounded-md border px-2 text-xs font-semibold transition-colors"
-                                    style={{
-                                      backgroundColor: 'var(--color-gray-700)',
-                                      color: 'var(--color-gray-200)',
-                                      borderColor: 'var(--color-gray-600)',
-                                    }}
-                                    onClick={() => setNeighborhoodRiskDrawMode(false)}
-                                    onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'var(--color-gray-600)' }}
-                                    onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = 'var(--color-gray-700)' }}
-                                    title="Cancel drawing"
-                                  >
-                                    Cancel
-                                  </button>
-                                </div>
-                              </>
-                            )}
-                            
-                            {/* List of existing polygons */}
-                            {neighborhoodPolygons.length > 0 && !neighborhoodRiskDrawMode && (
-                              <div className="mt-3 pt-2" style={{ borderTop: '1px solid var(--color-gray-600)' }}>
-                                <p className="text-xs font-medium mb-2" style={{ color: 'var(--color-gray-300)' }}>
-                                  Saved Polygons ({neighborhoodPolygons.length})
-                                </p>
-                                <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                                  {neighborhoodPolygons.map((feature, idx) => {
-                                    const riskLevel = feature.properties?.riskLevel || 'medium'
-                                    const riskColor = riskLevel === 'high' ? 'var(--color-red-500)' : riskLevel === 'medium' ? 'var(--color-orange-500)' : 'var(--color-green-500)'
-                                    const isEditing = selectedNeighborhoodRiskPolygonId === feature.id
+                              )}
+                              {stlNeighborhoodsLoadStatus === 'ready' && (
+                                <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
+                                  {filteredStlNeighborhoods.map((hood) => {
+                                    const enabled =
+                                      neighborhoodsRiskVisible &&
+                                      enabledStlNeighborhoodIds[hood.id] !== false
                                     return (
                                       <div
-                                        key={feature.id || idx}
-                                        className="flex items-center gap-2 px-2 py-1.5 rounded text-xs border"
+                                        key={hood.id}
+                                        className="flex items-center justify-between gap-2 px-2 py-1.5 rounded text-xs border"
                                         style={{
-                                          backgroundColor: isEditing ? 'rgba(147, 51, 234, 0.2)' : 'var(--color-gray-800)',
-                                          borderColor: isEditing ? 'var(--color-purple-600)' : 'var(--color-gray-700)',
+                                          backgroundColor: 'var(--color-gray-800)',
+                                          borderColor: 'var(--color-gray-700)',
+                                          opacity: neighborhoodsRiskVisible ? 1 : 0.55,
                                         }}
                                       >
-                                        <span
-                                          className="w-3 h-3 rounded-sm shrink-0"
-                                          style={{ backgroundColor: riskColor }}
-                                        />
-                                        <span className="flex-1 truncate" style={{ color: 'var(--color-gray-200)' }}>
-                                          {riskLevel.charAt(0).toUpperCase() + riskLevel.slice(1)} Risk #{idx + 1}
+                                        <span className="truncate flex-1" style={{ color: 'var(--color-gray-200)' }}>
+                                          {hood.name}
                                         </span>
                                         <button
                                           type="button"
-                                          className="shrink-0 p-1 rounded hover:bg-gray-700 transition-colors"
-                                          style={{ color: isEditing ? 'var(--color-purple-400)' : 'var(--color-blue-400)' }}
-                                          onClick={() => {
-                                            if (isEditing) {
-                                              setSelectedNeighborhoodRiskPolygonId(null)
-                                              setNeighborhoodRiskEditMode(false)
-                                            } else {
-                                              setSelectedNeighborhoodRiskPolygonId(feature.id)
-                                              setNeighborhoodRiskEditMode(true)
-                                            }
+                                          role="switch"
+                                          aria-checked={enabled}
+                                          disabled={!neighborhoodsRiskVisible}
+                                          className="relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors scale-85 disabled:cursor-not-allowed disabled:opacity-70"
+                                          style={{
+                                            backgroundColor: enabled ? 'var(--color-blue-600)' : 'var(--color-gray-400)',
                                           }}
-                                          title={isEditing ? 'Exit edit mode' : 'Edit polygon vertices'}
+                                          onClick={() => toggleStlNeighborhood(hood.id)}
+                                          aria-label={`Toggle ${hood.name}`}
                                         >
-                                          <Edit3 className="w-3 h-3" />
-                                        </button>
-                                        <button
-                                          type="button"
-                                          className="shrink-0 p-1 rounded hover:bg-gray-700 transition-colors"
-                                          style={{ color: 'var(--color-red-400)' }}
-                                          onClick={() => setDeletePolygonId(feature.id)}
-                                          onMouseDown={() => requestDeleteNeighborhoodRiskPolygon(feature.id)}
-                                          title="Delete polygon"
-                                        >
-                                          <Trash2 className="w-3 h-3" />
+                                          <span
+                                            className="pointer-events-none absolute left-0.5 top-0.5 h-3 w-3 rounded-full bg-white shadow transition-transform"
+                                            style={{
+                                              transform: enabled ? 'translateX(13px)' : 'translateX(0)',
+                                            }}
+                                          />
                                         </button>
                                       </div>
                                     )
                                   })}
+                                  {filteredStlNeighborhoods.length === 0 && (
+                                    <p className="text-xs" style={{ color: 'var(--color-gray-500)' }}>
+                                      No neighborhoods match your search.
+                                    </p>
+                                  )}
                                 </div>
-                              </div>
-                            )}
+                              )}
+                            </div>
                           </div>
                         )}
                       </div>

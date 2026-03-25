@@ -1,29 +1,16 @@
-const STORAGE_KEY = 'waterMains'
-
-const EMPTY_COLLECTION = {
+/** Default water mains shipped with the app (edit this file to change deployed geometry). */
+export const WATER_MAINS_DEFAULT = {
   type: 'FeatureCollection',
-  features: []
+  features: [],
 }
+
+let sessionWaterMains = null
 
 export function getWaterMainsData() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return EMPTY_COLLECTION
-    const parsed = JSON.parse(raw)
-    if (parsed && parsed.type === 'FeatureCollection' && Array.isArray(parsed.features)) {
-      return parsed
-    }
-    return EMPTY_COLLECTION
-  } catch (error) {
-    console.error('Error loading water mains:', error)
-    return EMPTY_COLLECTION
-  }
+  return sessionWaterMains ?? WATER_MAINS_DEFAULT
 }
 
+/** Session-only; not persisted across reloads. */
 export function saveWaterMainsData(featureCollection) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(featureCollection))
-  } catch (error) {
-    console.error('Error saving water mains:', error)
-  }
+  sessionWaterMains = featureCollection
 }

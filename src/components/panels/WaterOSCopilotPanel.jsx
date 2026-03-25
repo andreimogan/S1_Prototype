@@ -172,6 +172,7 @@ export default function WaterOSCopilotPanel() {
   
   // Input state for chat
   const [inputText, setInputText] = useState('')
+  const [panelSize, setPanelSize] = useState({ width: 438, height: 704 })
   
   // Count event context messages
   const eventContextMessages = chatMessages.filter(msg => msg.type === 'event-context')
@@ -320,6 +321,32 @@ export default function WaterOSCopilotPanel() {
       handleSendMessage()
     }
   }
+
+  const handleResizeMouseDown = (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+
+    const startX = e.clientX
+    const startY = e.clientY
+    const startWidth = panelSize.width
+    const startHeight = panelSize.height
+
+    const onMouseMove = (moveEvent) => {
+      const dx = moveEvent.clientX - startX
+      const dy = moveEvent.clientY - startY
+      const nextWidth = Math.min(Math.max(startWidth + dx, 360), window.innerWidth - 24)
+      const nextHeight = Math.min(Math.max(startHeight + dy, 420), window.innerHeight - 24)
+      setPanelSize({ width: nextWidth, height: nextHeight })
+    }
+
+    const onMouseUp = () => {
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup', onMouseUp)
+    }
+
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup', onMouseUp)
+  }
   
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
@@ -338,8 +365,8 @@ export default function WaterOSCopilotPanel() {
       style={{
         top: `${position.y}px`,
         left: `${position.x}px`,
-        width: '438px',
-        height: '704px',
+        width: `${panelSize.width}px`,
+        height: `${panelSize.height}px`,
         maxHeight: 'calc(100vh - 5rem)',
         backgroundColor: 'var(--sand-surface)',
         color: 'var(--color-gray-100)',
@@ -402,6 +429,7 @@ export default function WaterOSCopilotPanel() {
       <div
         className="absolute right-0 bottom-0 w-5 h-5 cursor-nwse-resize z-10 flex items-center justify-center opacity-40 hover:opacity-100"
         title="Drag to resize"
+        onMouseDown={handleResizeMouseDown}
       >
         <svg className="w-3 h-3" style={{ color: 'var(--color-gray-400)' }} viewBox="0 0 10 10" fill="currentColor">
           <path d="M9 1v8H1" stroke="currentColor" strokeWidth="1.5" fill="none"></path>

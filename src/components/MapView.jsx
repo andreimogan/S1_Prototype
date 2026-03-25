@@ -3,13 +3,24 @@ import maplibregl from 'maplibre-gl'
 import { PRESSURE_ZONES } from '../data/pressureZones'
 import { PRESSURE_SENSORS } from '../data/pressureSensors'
 import { PRESSURE_SENSOR_MAP_DATA } from '../data/pressureSensorData'
-import { BURST_EVENTS } from '../data/burstEvents'
-import { getNeighborhoodRiskData, saveNeighborhoodRiskData } from '../data/neighborhoodRiskData'
 import { getWaterMainsData, saveWaterMainsData } from '../data/waterMainsData'
+import {
+  getMergedSensorData,
+  getMergedPressureSensorMapData,
+  getMergedBurstData,
+  getMergedPressureZoneData,
+  setBurstPosition,
+  setPressureZonePolygonCoords,
+  setNetworkMeterPosition,
+  setPressureGaugePosition,
+} from '../data/mapSessionOverrides'
 import { usePanelContext } from '../contexts/PanelContext'
 import PressureSensorTooltip from './tooltips/PressureSensorTooltip'
 
 const MAPTILER_API_KEY = 'X1kjwlVN29N1UZItdixx'
+const WATER_MAINS_UNIFORM_WIDTH = 2
+const BURST_AFFECTED_WATER_MAINS_DISTANCE_M = 180
+const SYNTHETIC_WATER_MAINS_DEBOUNCE_MS = 350
 
 // Helper function to get color for meter status
 function getStatusColor(status) {
@@ -31,64 +42,254 @@ function getPressureSensorBgColor(status) {
   }
 }
 
-// Helper function to get meter data with saved positions applied
-function getMergedSensorData() {
-  try {
-    const savedPositions = JSON.parse(localStorage.getItem('sensorPositions') || '{}')
-    
-    // If no saved positions, return original data
-    if (Object.keys(savedPositions).length === 0) {
-      return PRESSURE_SENSORS
+function isPointInRing(point, ring) {
+  const [x, y] = point
+  let inside = false
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i]
+    const [xj, yj] = ring[j]
+    const intersects = ((yi > y) !== (yj > y)) && (x < ((xj - xi) * (y - yi)) / (yj - yi) + xi)
+    if (intersects) inside = !inside
+  }
+  return inside
+}
+
+function isPointInPolygon(point, rings) {
+  if (!rings?.length) return false
+  if (!isPointInRing(point, rings[0])) return false
+  for (let i = 1; i < rings.length; i++) {
+    if (isPointInRing(point, rings[i])) return false
+  }
+  return true
+}
+
+function isPointInGeometry(point, geometry) {
+  if (!geometry) return false
+  if (geometry.type === 'Polygon') return isPointInPolygon(point, geometry.coordinates)
+  if (geometry.type === 'MultiPolygon') {
+    return geometry.coordinates.some((rings) => isPointInPolygon(point, rings))
+  }
+  return false
+}
+
+function buildUnifiedPressureZoneFromNeighborhoods(stlGeojson) {
+  const polygons = []
+  ;(stlGeojson?.features || []).forEach((feature) => {
+    const geometry = feature?.geometry
+    if (!geometry) return
+    if (geometry.type === 'Polygon') {
+      polygons.push(geometry.coordinates)
+    } else if (geometry.type === 'MultiPolygon') {
+      geometry.coordinates.forEach((poly) => polygons.push(poly))
     }
-    
-    // Create a copy and apply saved positions
-    const mergedData = {
-      ...PRESSURE_SENSORS,
-      features: PRESSURE_SENSORS.features.map(feature => {
-        if (savedPositions[feature.id]) {
-          return {
-            ...feature,
-            geometry: {
-              ...feature.geometry,
-              coordinates: savedPositions[feature.id].coordinates
-            }
-          }
-        }
-        return feature
-      })
-    }
-    
-    return mergedData
-  } catch (error) {
-    console.error('Error loading saved meter positions:', error)
-    return PRESSURE_SENSORS
+  })
+
+  if (polygons.length === 0) return null
+
+  return {
+    type: 'FeatureCollection',
+    features: [
+      {
+        type: 'Feature',
+        id: 'zone-stl-neighborhoods-unified',
+        properties: {
+          zoneId: 'zone-stl-unified',
+          name: 'St. Louis Unified Pressure Zone',
+          riskLevel: 'high',
+          affectedPipes: 45,
+          averagePSI: 22,
+          status: 'critical',
+          description: 'Pressure zone derived from all St. Louis neighborhoods merged into one detailed area.',
+          redPipePercent: 7.67,
+          complaints: 67,
+          totalConnections: 1263,
+          criticalCustomers: 23,
+          pressureMonitors: 11,
+          pressureGroups: 2,
+          burstPOIs: 9,
+          totalPipeMiles: 753,
+          householdPercent: 75,
+          nonHouseholdPercent: 25,
+        },
+        geometry: {
+          type: 'MultiPolygon',
+          coordinates: polygons,
+        },
+      },
+    ],
   }
 }
 
-// Helper function to get pressure sensor (gauge) data with saved positions applied
-function getMergedPressureSensorMapData() {
-  try {
-    const savedPositions = JSON.parse(localStorage.getItem('pressureSensorPositions') || '{}')
-    if (Object.keys(savedPositions).length === 0) return PRESSURE_SENSOR_MAP_DATA
-    return {
-      ...PRESSURE_SENSOR_MAP_DATA,
-      features: PRESSURE_SENSOR_MAP_DATA.features.map((feature) => {
-        if (savedPositions[feature.id]) {
-          return {
-            ...feature,
-            geometry: {
-              ...feature.geometry,
-              coordinates: savedPositions[feature.id].coordinates,
-            },
-          }
-        }
-        return feature
-      }),
-    }
-  } catch (error) {
-    console.error('Error loading saved pressure sensor positions:', error)
-    return PRESSURE_SENSOR_MAP_DATA
+function isPointInsideNeighborhoods(point, stlGeojson) {
+  return (stlGeojson?.features || []).some((feature) => isPointInGeometry(point, feature.geometry))
+}
+
+function computeGeojsonBbox(geojson) {
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+
+  const consumeCoord = (coord) => {
+    if (!Array.isArray(coord) || coord.length < 2) return
+    const [x, y] = coord
+    if (typeof x !== 'number' || typeof y !== 'number') return
+    minX = Math.min(minX, x)
+    minY = Math.min(minY, y)
+    maxX = Math.max(maxX, x)
+    maxY = Math.max(maxY, y)
   }
+
+  const walk = (coords) => {
+    if (!Array.isArray(coords)) return
+    if (coords.length >= 2 && typeof coords[0] === 'number') {
+      consumeCoord(coords)
+      return
+    }
+    coords.forEach(walk)
+  }
+
+  ;(geojson?.features || []).forEach((f) => walk(f?.geometry?.coordinates))
+  if (!isFinite(minX)) return null
+  return { minX, minY, maxX, maxY }
+}
+
+function bboxIntersects(a, b) {
+  return !(a.maxX < b.minX || a.minX > b.maxX || a.maxY < b.minY || a.minY > b.maxY)
+}
+
+function lineCoordsBbox(coords) {
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (const c of coords) {
+    if (!Array.isArray(c) || c.length < 2) continue
+    const [x, y] = c
+    if (typeof x !== 'number' || typeof y !== 'number') continue
+    minX = Math.min(minX, x)
+    minY = Math.min(minY, y)
+    maxX = Math.max(maxX, x)
+    maxY = Math.max(maxY, y)
+  }
+  if (!isFinite(minX)) return null
+  return { minX, minY, maxX, maxY }
+}
+
+function distancePointToSegmentMeters(point, segStart, segEnd) {
+  // Local equirectangular projection around segment midpoint for stable meter distances.
+  const lon0 = ((segStart[0] + segEnd[0]) / 2) * (Math.PI / 180)
+  const lat0 = ((segStart[1] + segEnd[1]) / 2) * (Math.PI / 180)
+  const mPerDegLat = 111132
+  const mPerDegLon = 111320 * Math.cos(lat0)
+
+  const px = point[0] * mPerDegLon
+  const py = point[1] * mPerDegLat
+  const ax = segStart[0] * mPerDegLon
+  const ay = segStart[1] * mPerDegLat
+  const bx = segEnd[0] * mPerDegLon
+  const by = segEnd[1] * mPerDegLat
+
+  const abx = bx - ax
+  const aby = by - ay
+  const apx = px - ax
+  const apy = py - ay
+  const ab2 = abx * abx + aby * aby
+  if (ab2 === 0) {
+    const dx = px - ax
+    const dy = py - ay
+    return Math.sqrt(dx * dx + dy * dy)
+  }
+  const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / ab2))
+  const cx = ax + t * abx
+  const cy = ay + t * aby
+  const dx = px - cx
+  const dy = py - cy
+  return Math.sqrt(dx * dx + dy * dy)
+}
+
+function isLineNearAnyBurst(lineCoords, burstPoints, thresholdMeters) {
+  if (!Array.isArray(lineCoords) || lineCoords.length < 2) return false
+  for (let i = 1; i < lineCoords.length; i++) {
+    const a = lineCoords[i - 1]
+    const b = lineCoords[i]
+    for (const burstPoint of burstPoints) {
+      if (distancePointToSegmentMeters(burstPoint, a, b) <= thresholdMeters) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+function clipLineStringToNeighborhoods(coords, stlGeojson) {
+  const segments = []
+  let current = []
+
+  coords.forEach((coord) => {
+    const inside = isPointInsideNeighborhoods(coord, stlGeojson)
+    if (inside) {
+      current.push(coord)
+    } else {
+      if (current.length >= 2) segments.push(current)
+      current = []
+    }
+  })
+
+  if (current.length >= 2) segments.push(current)
+  return segments
+}
+
+function buildCityWaterMainsFromRoadFeatures(roadFeatures, stlGeojson, burstPoints) {
+  const features = []
+  const neighborhoodsBbox = computeGeojsonBbox(stlGeojson)
+  const burstPts = Array.isArray(burstPoints) ? burstPoints : []
+
+  roadFeatures.forEach((feature, idx) => {
+    const geometry = feature?.geometry
+    if (!geometry) return
+
+    const pushSegment = (coords, suffix) => {
+      // Skip degenerate segments early.
+      if (!Array.isArray(coords) || coords.length < 2) return
+      const affected = isLineNearAnyBurst(
+        coords,
+        burstPts,
+        BURST_AFFECTED_WATER_MAINS_DISTANCE_M
+      )
+      if (!affected) return
+      features.push({
+        type: 'Feature',
+        id: `wm-city-${idx}-${suffix}`,
+        properties: {
+          riskLevel: 'high',
+          synthetic: true,
+          __affectedByBurst: true,
+        },
+        geometry: { type: 'LineString', coordinates: coords },
+      })
+    }
+
+    if (geometry.type === 'LineString') {
+      if (neighborhoodsBbox) {
+        const bb = lineCoordsBbox(geometry.coordinates)
+        if (bb && !bboxIntersects(bb, neighborhoodsBbox)) return
+      }
+      const segments = clipLineStringToNeighborhoods(geometry.coordinates, stlGeojson)
+      segments.forEach((segment, segIdx) => pushSegment(segment, segIdx))
+    } else if (geometry.type === 'MultiLineString') {
+      geometry.coordinates.forEach((lineCoords, lineIdx) => {
+        if (neighborhoodsBbox) {
+          const bb = lineCoordsBbox(lineCoords)
+          if (bb && !bboxIntersects(bb, neighborhoodsBbox)) return
+        }
+        const segments = clipLineStringToNeighborhoods(lineCoords, stlGeojson)
+        segments.forEach((segment, segIdx) => pushSegment(segment, `${lineIdx}-${segIdx}`))
+      })
+    }
+  })
+
+  return { type: 'FeatureCollection', features }
 }
 
 // MapView component with pressure zone visualization
@@ -120,16 +321,8 @@ export default function MapView() {
     burstEditMode,
     pressureZoneEditMode,
     neighborhoodsRiskVisible,
-    neighborhoodRiskDrawMode,
-    setNeighborhoodRiskDrawMode,
-    neighborhoodRiskDrawLevel,
-    completeNeighborhoodRiskPolygonRequest,
-    requestCompleteNeighborhoodRiskPolygon,
-    setNeighborhoodDrawPointCount,
-    neighborhoodRiskEditMode,
-    selectedNeighborhoodRiskPolygonId,
-    setNeighborhoodRiskEditMode,
-    deleteNeighborhoodRiskPolygonId,
+    enabledStlNeighborhoodIds,
+    stlNeighborhoodsGeojson,
     burstGradientParams,
     setSelectedZone, 
     setPressureZoneVisible,
@@ -146,12 +339,12 @@ export default function MapView() {
   const burstMarkersRef = useRef([])
   const sensorMarkers = useRef([])
   const polygonVertexMarkers = useRef([])
+  const waterMainsRoadLayerIdsRef = useRef([])
+  const syntheticWaterMainsDebounceRef = useRef(null)
+  const syntheticWaterMainsSignatureRef = useRef(null)
   const [isDraggingSensor, setIsDraggingSensor] = useState(false)
   const markerClickedRef = useRef(false)
-  const neighborhoodRiskDrawModeRef = useRef(false)
-  const neighborhoodDrawPointsRef = useRef([])
-  const neighborhoodRiskEditVertexMarkers = useRef([])
-  const [neighborhoodDrawPoints, setNeighborhoodDrawPoints] = useState([])
+  // (Neighborhood risk custom polygon draw feature removed)
   
   const waterMainsDrawModeRef = useRef(false)
   const waterMainDrawPointsRef = useRef([])
@@ -159,6 +352,28 @@ export default function MapView() {
   const pressureSensorMarkersRef = useRef([])
   const [hoveredPressureSensor, setHoveredPressureSensor] = useState(null)
   const [pressureSensorTooltipPos, setPressureSensorTooltipPos] = useState(null)
+
+  // Console helpers: after drawing/editing on the map, run these and paste into src/data/*.js to ship geometry.
+  useEffect(() => {
+    window.exportPressureZonesToSource = () => {
+      const data = getMergedPressureZoneData()
+      const code = `export const PRESSURE_ZONES = ${JSON.stringify(data, null, 2)}`
+      console.log('\n📤 Replace the contents of src/data/pressureZones.js with:\n')
+      console.log(code)
+      navigator.clipboard.writeText(code).then(() => console.log('✅ Copied to clipboard')).catch(() => {})
+    }
+    window.exportWaterMainsToSource = () => {
+      const data = getWaterMainsData()
+      const code = `export const WATER_MAINS_DEFAULT = ${JSON.stringify(data, null, 2)}`
+      console.log('\n📤 In src/data/waterMainsData.js, replace WATER_MAINS_DEFAULT with:\n')
+      console.log(code)
+      navigator.clipboard.writeText(code).then(() => console.log('✅ Copied to clipboard')).catch(() => {})
+    }
+    return () => {
+      delete window.exportPressureZonesToSource
+      delete window.exportWaterMainsToSource
+    }
+  }, [])
 
   useEffect(() => {
     if (map.current) return // Initialize map only once
@@ -192,10 +407,29 @@ export default function MapView() {
       console.log('📊 Feature types:', PRESSURE_ZONES.features.map(f => `${f.properties.name} (${f.properties.riskLevel})`))
       
       try {
+        // Capture road layer ids; used to generate city-only synthetic water mains.
+        const styleLayers = map.current.getStyle()?.layers || []
+        const waterMainsSourceLayers = styleLayers.filter((layer) => {
+          if (layer.type !== 'line') return false
+          const id = String(layer.id || '').toLowerCase()
+          const sourceLayer = String(layer['source-layer'] || '').toLowerCase()
+          return (
+            id.includes('road') ||
+            id.includes('street') ||
+            id.includes('highway') ||
+            id.includes('motorway') ||
+            id.includes('transport') ||
+            sourceLayer.includes('road') ||
+            sourceLayer.includes('transport')
+          )
+        })
+        waterMainsRoadLayerIdsRef.current = waterMainsSourceLayers.map((layer) => layer.id)
+
         // Add pressure zones source
+        const initialUnifiedZoneData = buildUnifiedPressureZoneFromNeighborhoods(stlNeighborhoodsGeojson)
         map.current.addSource('pressure-zones', {
           type: 'geojson',
-          data: getMergedPressureZoneData()
+          data: initialUnifiedZoneData || getMergedPressureZoneData()
         })
         console.log('✅ Pressure zones source added with saved polygon data')
         
@@ -248,72 +482,35 @@ export default function MapView() {
         })
         console.log('✅ Pressure zones border layer added')
         
-        // Neighborhood risk polygons (multi-polygon, same risk levels/colors)
-        map.current.addSource('neighborhood-risk', {
+        // St. Louis neighborhoods outlines (from ArcGIS FeatureServer)
+        map.current.addSource('stl-neighborhoods', {
           type: 'geojson',
-          data: getNeighborhoodRiskData()
+          data: { type: 'FeatureCollection', features: [] },
         })
         map.current.addLayer({
-          id: 'neighborhood-risk-fill',
+          id: 'stl-neighborhoods-fill',
           type: 'fill',
-          source: 'neighborhood-risk',
+          source: 'stl-neighborhoods',
           paint: {
             'fill-color': [
-              'match',
-              ['get', 'riskLevel'],
-              'high', 'rgba(212, 51, 59, 0.4)',
-              'medium', 'rgba(241, 167, 40, 0.4)',
-              'low', 'rgba(127, 190, 72, 0.4)',
-              'rgba(158, 158, 158, 0.2)'
+              'case',
+              ['boolean', ['get', '__affectedByBurst'], false],
+              'rgba(220, 38, 38, 0.1)',
+              'rgba(255, 255, 255, 0.1)',
             ],
-            'fill-opacity': 0.6
           },
-          layout: { visibility: 'none' }
+          layout: { visibility: 'none' },
         })
         map.current.addLayer({
-          id: 'neighborhood-risk-border',
+          id: 'stl-neighborhoods-outline',
           type: 'line',
-          source: 'neighborhood-risk',
+          source: 'stl-neighborhoods',
           paint: {
-            'line-color': [
-              'match',
-              ['get', 'riskLevel'],
-              'high', 'rgb(212, 51, 59)',
-              'medium', 'rgb(241, 167, 40)',
-              'low', 'rgb(127, 190, 72)',
-              'rgb(158, 158, 158)'
-            ],
-            'line-width': 2,
-            'line-opacity': 0.8
+            'line-color': 'rgba(156, 163, 175, 0.9)',
+            'line-width': 1.5,
+            'line-opacity': 0.85,
           },
-          layout: { visibility: 'none' }
-        })
-        
-        // Temporary draw preview for neighborhood risk (visible only in draw mode)
-        map.current.addSource('neighborhood-risk-draw', {
-          type: 'geojson',
-          data: { type: 'FeatureCollection', features: [] }
-        })
-        map.current.addLayer({
-          id: 'neighborhood-risk-draw-fill',
-          type: 'fill',
-          source: 'neighborhood-risk-draw',
-          paint: {
-            'fill-color': 'rgba(147, 197, 253, 0.35)',
-            'fill-outline-color': 'rgb(96, 165, 250)'
-          },
-          layout: { visibility: 'none' }
-        })
-        map.current.addLayer({
-          id: 'neighborhood-risk-draw-line',
-          type: 'line',
-          source: 'neighborhood-risk-draw',
-          paint: {
-            'line-color': 'rgb(96, 165, 250)',
-            'line-width': 2,
-            'line-dasharray': [2, 1]
-          },
-          layout: { visibility: 'none' }
+          layout: { visibility: 'none' },
         })
         
         // Water mains source and layers
@@ -329,15 +526,13 @@ export default function MapView() {
           source: 'water-mains',
           paint: {
             'line-color': [
-              'match',
-              ['get', 'riskLevel'],
-              'high', 'rgb(212, 51, 59)',
-              'medium', 'rgb(241, 167, 40)',
-              'low', 'rgb(127, 190, 72)',
-              'rgb(59, 130, 246)'
+              'case',
+              ['boolean', ['get', '__affectedByBurst'], false],
+              'rgba(220, 38, 38, 0.9)',
+              'rgba(56, 189, 248, 0.55)',
             ],
-            'line-width': 3,
-            'line-opacity': 0.85
+            'line-width': WATER_MAINS_UNIFORM_WIDTH,
+            'line-opacity': 0.82
           },
           layout: { visibility: 'none' }
         })
@@ -386,10 +581,6 @@ export default function MapView() {
           if (markerClickedRef.current) {
             console.log('🖱️ Clicked on a marker, ignoring pressure zone click')
             markerClickedRef.current = false
-            return
-          }
-          // When drawing neighborhood risk polygon, map click is for adding vertices - don't open zone panel
-          if (neighborhoodRiskDrawModeRef.current) {
             return
           }
           
@@ -745,101 +936,142 @@ export default function MapView() {
 
   // Toggle neighborhood risk layer visibility
   useEffect(() => {
-    if (!mapLoaded || !map.current || !map.current.loaded()) return
+    if (!mapLoaded || !map.current) return
     const visibility = neighborhoodsRiskVisible ? 'visible' : 'none'
     try {
-      if (map.current.getLayer('neighborhood-risk-fill')) {
-        map.current.setLayoutProperty('neighborhood-risk-fill', 'visibility', visibility)
+      if (map.current.getLayer('stl-neighborhoods-outline')) {
+        map.current.setLayoutProperty('stl-neighborhoods-outline', 'visibility', visibility)
       }
-      if (map.current.getLayer('neighborhood-risk-border')) {
-        map.current.setLayoutProperty('neighborhood-risk-border', 'visibility', visibility)
+      if (map.current.getLayer('stl-neighborhoods-fill')) {
+        map.current.setLayoutProperty('stl-neighborhoods-fill', 'visibility', visibility)
       }
     } catch (error) {
       console.error('Error toggling neighborhood risk visibility:', error)
     }
   }, [neighborhoodsRiskVisible, mapLoaded])
 
-  // Neighborhood risk draw mode: map click adds vertex; double-click or Enter completes
+  // St. Louis boundaries: main toggle + per-neighborhood ids both drive source data.
   useEffect(() => {
-    neighborhoodRiskDrawModeRef.current = neighborhoodRiskDrawMode
     if (!mapLoaded || !map.current) return
-    if (!neighborhoodRiskDrawMode) {
-      setNeighborhoodDrawPoints([])
-      map.current.getCanvas().style.cursor = ''
+    const source = map.current.getSource('stl-neighborhoods')
+    if (!source) return
+
+    try {
+      if (!neighborhoodsRiskVisible || !stlNeighborhoodsGeojson) {
+        source.setData({ type: 'FeatureCollection', features: [] })
+        return
+      }
+
+      const burstPoints = (getMergedBurstData().features || [])
+        .map((feature) => feature?.geometry?.coordinates)
+        .filter((coords) => Array.isArray(coords) && coords.length >= 2)
+
+      const features = stlNeighborhoodsGeojson.features.filter((f) => {
+        const id = f.properties?.__hoodId
+        if (id == null) return false
+        return enabledStlNeighborhoodIds[id] !== false
+      }).map((feature) => {
+        const affected = burstPoints.some((point) => isPointInGeometry(point, feature.geometry))
+        return {
+          ...feature,
+          properties: {
+            ...feature.properties,
+            __affectedByBurst: affected,
+          },
+        }
+      })
+      source.setData({ type: 'FeatureCollection', features })
+      if (map.current.getLayer('stl-neighborhoods-outline')) {
+        map.current.setFilter('stl-neighborhoods-outline', null)
+      }
+    } catch (error) {
+      console.error('Error applying St. Louis neighborhood outlines:', error)
+    }
+  }, [enabledStlNeighborhoodIds, mapLoaded, neighborhoodsRiskVisible, stlNeighborhoodsGeojson])
+
+  // Build synthetic city-only water mains from rendered road geometry clipped to neighborhoods.
+  useEffect(() => {
+    if (!mapLoaded || !map.current) return
+    const source = map.current.getSource('water-mains')
+    if (!source) return
+
+    // Only compute when Water Mains layer is enabled.
+    if (!waterMainsVisible) {
       try {
-        if (map.current.getSource('neighborhood-risk-draw')) {
-          map.current.getSource('neighborhood-risk-draw').setData({ type: 'FeatureCollection', features: [] })
-        }
-        if (map.current.getLayer('neighborhood-risk-draw-fill')) {
-          map.current.setLayoutProperty('neighborhood-risk-draw-fill', 'visibility', 'none')
-        }
-        if (map.current.getLayer('neighborhood-risk-draw-line')) {
-          map.current.setLayoutProperty('neighborhood-risk-draw-line', 'visibility', 'none')
-        }
+        source.setData({ type: 'FeatureCollection', features: [] })
       } catch (e) { /* ignore */ }
       return
     }
-    map.current.getCanvas().style.cursor = 'crosshair'
-    const onMapClick = (e) => {
-      if (e.originalEvent.detail === 2 && neighborhoodDrawPointsRef.current.length >= 3) {
-        requestCompleteNeighborhoodRiskPolygon()
-        return
+
+    const refreshSyntheticWaterMains = () => {
+      try {
+        if (!stlNeighborhoodsGeojson) {
+          source.setData({ type: 'FeatureCollection', features: [] })
+          return
+        }
+
+        const roadLayerIds = waterMainsRoadLayerIdsRef.current.filter((id) => map.current.getLayer(id))
+        if (roadLayerIds.length === 0) return
+
+        const renderedRoadFeatures = map.current.queryRenderedFeatures(undefined, { layers: roadLayerIds })
+        const burstPoints = (getMergedBurstData().features || [])
+          .map((feature) => feature?.geometry?.coordinates)
+          .filter((coords) => Array.isArray(coords) && coords.length >= 2)
+        const syntheticWaterMains = buildCityWaterMainsFromRoadFeatures(
+          renderedRoadFeatures,
+          stlNeighborhoodsGeojson,
+          burstPoints
+        )
+        // Skip setData if there is no meaningful change.
+        const signature = {
+          features: syntheticWaterMains.features.length,
+          points: syntheticWaterMains.features.reduce((sum, f) => sum + (f.geometry?.coordinates?.length || 0), 0),
+        }
+        const prev = syntheticWaterMainsSignatureRef.current
+        if (prev && prev.features === signature.features && prev.points === signature.points) {
+          return
+        }
+        syntheticWaterMainsSignatureRef.current = signature
+        source.setData(syntheticWaterMains)
+      } catch (error) {
+        console.error('Error building synthetic city water mains:', error)
       }
-      setNeighborhoodDrawPoints(prev => [...prev, [e.lngLat.lng, e.lngLat.lat]])
     }
-    const onKeyDown = (e) => {
-      if (e.key === 'Enter' && neighborhoodDrawPointsRef.current.length >= 3) {
-        e.preventDefault()
-        requestCompleteNeighborhoodRiskPolygon()
+
+    const scheduleRefresh = () => {
+      if (syntheticWaterMainsDebounceRef.current) {
+        clearTimeout(syntheticWaterMainsDebounceRef.current)
       }
-      if (e.key === 'Escape') {
-        setNeighborhoodRiskDrawMode(false)
-      }
+      syntheticWaterMainsDebounceRef.current = setTimeout(() => {
+        syntheticWaterMainsDebounceRef.current = null
+        refreshSyntheticWaterMains()
+      }, SYNTHETIC_WATER_MAINS_DEBOUNCE_MS)
     }
-    map.current.on('click', onMapClick)
-    window.addEventListener('keydown', onKeyDown)
-    try {
-      if (map.current.getLayer('neighborhood-risk-draw-fill')) {
-        map.current.setLayoutProperty('neighborhood-risk-draw-fill', 'visibility', 'visible')
-      }
-      if (map.current.getLayer('neighborhood-risk-draw-line')) {
-        map.current.setLayoutProperty('neighborhood-risk-draw-line', 'visibility', 'visible')
-      }
-    } catch (e) { /* ignore */ }
+
+    scheduleRefresh()
+    map.current.on('moveend', scheduleRefresh)
+
     return () => {
-      map.current.off('click', onMapClick)
-      window.removeEventListener('keydown', onKeyDown)
-      map.current.getCanvas().style.cursor = ''
+      if (!map.current) return
+      map.current.off('moveend', scheduleRefresh)
+      if (syntheticWaterMainsDebounceRef.current) {
+        clearTimeout(syntheticWaterMainsDebounceRef.current)
+        syntheticWaterMainsDebounceRef.current = null
+      }
     }
-  }, [neighborhoodRiskDrawMode, mapLoaded, requestCompleteNeighborhoodRiskPolygon])
+  }, [mapLoaded, stlNeighborhoodsGeojson, waterMainsVisible])
 
-  // Keep ref in sync for click handler; sync point count to context for panel
+  // Build one unified pressure zone from all loaded St. Louis neighborhoods.
   useEffect(() => {
-    neighborhoodDrawPointsRef.current = neighborhoodDrawPoints
-    setNeighborhoodDrawPointCount(neighborhoodDrawPoints.length)
-  }, [neighborhoodDrawPoints, setNeighborhoodDrawPointCount])
+    if (!mapLoaded || !map.current || !stlNeighborhoodsGeojson) return
+    const source = map.current.getSource('pressure-zones')
+    if (!source) return
 
-  // Update draw preview source when points change
-  useEffect(() => {
-    if (!mapLoaded || !map.current || !map.current.getSource('neighborhood-risk-draw')) return
-    const points = neighborhoodDrawPoints
-    let features = []
-    if (points.length >= 3) {
-      const ring = [...points, points[0]]
-      features = [{
-        type: 'Feature',
-        properties: {},
-        geometry: { type: 'Polygon', coordinates: [ring] }
-      }]
-    } else if (points.length === 2) {
-      features = [{
-        type: 'Feature',
-        properties: {},
-        geometry: { type: 'LineString', coordinates: points }
-      }]
-    }
-    map.current.getSource('neighborhood-risk-draw').setData({ type: 'FeatureCollection', features })
-  }, [neighborhoodDrawPoints, mapLoaded])
+    const unifiedZoneData = buildUnifiedPressureZoneFromNeighborhoods(stlNeighborhoodsGeojson)
+    if (!unifiedZoneData) return
+
+    source.setData(unifiedZoneData)
+  }, [mapLoaded, stlNeighborhoodsGeojson])
 
   // Water mains draw mode: map click adds point; double-click or Enter completes
   useEffect(() => {
@@ -980,7 +1212,7 @@ export default function MapView() {
       features: [...collection.features, feature]
     }
     saveWaterMainsData(newCollection)
-    if (map.current && map.current.getSource('water-mains')) {
+    if (map.current && map.current.getSource('water-mains') && !stlNeighborhoodsGeojson) {
       map.current.getSource('water-mains').setData(newCollection)
     }
     console.log('Water main saved, clearing points and exiting draw mode')
@@ -992,7 +1224,7 @@ export default function MapView() {
       console.log('Exiting draw mode')
       setWaterMainsDrawMode(false)
     }, 50)
-  }, [completeWaterMainRequest, waterMainsDrawLevel])
+  }, [completeWaterMainRequest, stlNeighborhoodsGeojson, waterMainsDrawLevel])
 
   // Delete water main when requested
   useEffect(() => {
@@ -1003,283 +1235,10 @@ export default function MapView() {
       features: collection.features.filter(f => f.id !== deleteWaterMainId)
     }
     saveWaterMainsData(newCollection)
-    if (map.current && map.current.getSource('water-mains')) {
+    if (map.current && map.current.getSource('water-mains') && !stlNeighborhoodsGeojson) {
       map.current.getSource('water-mains').setData(newCollection)
     }
-  }, [deleteWaterMainId])
-
-  // Complete neighborhood risk polygon when requested from panel
-  useEffect(() => {
-    if (completeNeighborhoodRiskPolygonRequest === 0) return
-    if (neighborhoodDrawPoints.length < 3) return
-    const points = neighborhoodDrawPoints
-    const ring = [...points, points[0]]
-    const feature = {
-      type: 'Feature',
-      id: `neighborhood-risk-${Date.now()}`,
-      properties: { riskLevel: neighborhoodRiskDrawLevel },
-      geometry: { type: 'Polygon', coordinates: [ring] }
-    }
-    const collection = getNeighborhoodRiskData()
-    const newCollection = {
-      ...collection,
-      features: [...collection.features, feature]
-    }
-    saveNeighborhoodRiskData(newCollection)
-    if (map.current && map.current.getSource('neighborhood-risk')) {
-      map.current.getSource('neighborhood-risk').setData(newCollection)
-    }
-    setNeighborhoodDrawPoints([])
-    setNeighborhoodRiskDrawMode(false)
-  }, [completeNeighborhoodRiskPolygonRequest])
-
-  // Delete neighborhood risk polygon when requested
-  useEffect(() => {
-    if (!deleteNeighborhoodRiskPolygonId) return
-    const collection = getNeighborhoodRiskData()
-    const newCollection = {
-      ...collection,
-      features: collection.features.filter(f => f.id !== deleteNeighborhoodRiskPolygonId)
-    }
-    saveNeighborhoodRiskData(newCollection)
-    if (map.current && map.current.getSource('neighborhood-risk')) {
-      map.current.getSource('neighborhood-risk').setData(newCollection)
-    }
-  }, [deleteNeighborhoodRiskPolygonId])
-
-  // Delete neighborhood risk polygon when requested
-  useEffect(() => {
-    if (!deleteNeighborhoodRiskPolygonId) return
-    const collection = getNeighborhoodRiskData()
-    const newCollection = {
-      ...collection,
-      features: collection.features.filter(f => f.id !== deleteNeighborhoodRiskPolygonId)
-    }
-    saveNeighborhoodRiskData(newCollection)
-    if (map.current && map.current.getSource('neighborhood-risk')) {
-      map.current.getSource('neighborhood-risk').setData(newCollection)
-    }
-    if (selectedNeighborhoodRiskPolygonId === deleteNeighborhoodRiskPolygonId) {
-      setNeighborhoodRiskEditMode(false)
-    }
-  }, [deleteNeighborhoodRiskPolygonId, selectedNeighborhoodRiskPolygonId, setNeighborhoodRiskEditMode])
-
-  // Edit mode for neighborhood risk polygon: show vertex markers (similar to pressure zone edit)
-  useEffect(() => {
-    if (!mapLoaded || !map.current) return
-    
-    neighborhoodRiskEditVertexMarkers.current.forEach(marker => marker.remove())
-    neighborhoodRiskEditVertexMarkers.current = []
-    
-    if (!neighborhoodRiskEditMode || !selectedNeighborhoodRiskPolygonId) return
-    
-    const collection = getNeighborhoodRiskData()
-    const feature = collection.features.find(f => f.id === selectedNeighborhoodRiskPolygonId)
-    if (!feature || !feature.geometry || feature.geometry.type !== 'Polygon') return
-    
-    const coordinates = feature.geometry.coordinates[0]
-    const vertices = coordinates.slice(0, -1)
-    
-    const createMarkers = () => {
-      neighborhoodRiskEditVertexMarkers.current.forEach(marker => marker.remove())
-      neighborhoodRiskEditVertexMarkers.current = []
-      
-      vertices.forEach((coord, index) => {
-        const el = document.createElement('div')
-        el.className = 'polygon-vertex-marker'
-        el.title = `Vertex ${index + 1} (double-click to delete)`
-        el.dataset.type = 'vertex'
-        el.dataset.index = index
-        
-        const marker = new maplibregl.Marker({
-          element: el,
-          draggable: true,
-          anchor: 'center'
-        })
-          .setLngLat(coord)
-          .addTo(map.current)
-        
-        marker.on('drag', () => {
-          updatePolygonGeometry()
-          updateMidpoints()
-        })
-        
-        marker.on('dragend', () => {
-          saveCurrentPolygon()
-        })
-        
-        el.addEventListener('dblclick', (e) => {
-          e.stopPropagation()
-          const vertexMarkers = neighborhoodRiskEditVertexMarkers.current.filter(
-            m => m.getElement().dataset.type === 'vertex'
-          )
-          if (vertexMarkers.length > 3) {
-            deleteVertexAtIndex(index)
-          }
-        })
-        
-        neighborhoodRiskEditVertexMarkers.current.push(marker)
-      })
-      
-      createMidpoints()
-    }
-    
-    const createMidpoints = () => {
-      neighborhoodRiskEditVertexMarkers.current
-        .filter(m => m.getElement().dataset.type === 'midpoint')
-        .forEach(m => {
-          m.remove()
-          const index = neighborhoodRiskEditVertexMarkers.current.indexOf(m)
-          if (index > -1) neighborhoodRiskEditVertexMarkers.current.splice(index, 1)
-        })
-      
-      const vertexMarkers = neighborhoodRiskEditVertexMarkers.current.filter(
-        m => m.getElement().dataset.type === 'vertex'
-      )
-      
-      vertexMarkers.forEach((marker, index) => {
-        const nextMarker = vertexMarkers[(index + 1) % vertexMarkers.length]
-        const coord1 = marker.getLngLat()
-        const coord2 = nextMarker.getLngLat()
-        const midpoint = [(coord1.lng + coord2.lng) / 2, (coord1.lat + coord2.lat) / 2]
-        
-        const el = document.createElement('div')
-        el.className = 'polygon-midpoint-marker'
-        el.title = 'Click to add vertex'
-        el.dataset.type = 'midpoint'
-        el.dataset.afterIndex = index
-        
-        const midpointMarker = new maplibregl.Marker({
-          element: el,
-          draggable: false,
-          anchor: 'center'
-        }).setLngLat(midpoint).addTo(map.current)
-        
-        el.addEventListener('click', (e) => {
-          e.stopPropagation()
-          const afterIndex = parseInt(el.dataset.afterIndex)
-          addVertexAtIndex(afterIndex, midpoint)
-        })
-        
-        neighborhoodRiskEditVertexMarkers.current.push(midpointMarker)
-      })
-    }
-    
-    const updateMidpoints = () => {
-      const vertexMarkers = neighborhoodRiskEditVertexMarkers.current.filter(m => m.getElement().dataset.type === 'vertex')
-      const midpointMarkers = neighborhoodRiskEditVertexMarkers.current.filter(m => m.getElement().dataset.type === 'midpoint')
-      midpointMarkers.forEach((midpointMarker) => {
-        const el = midpointMarker.getElement()
-        const afterIndex = parseInt(el.dataset.afterIndex)
-        const marker = vertexMarkers[afterIndex]
-        const nextMarker = vertexMarkers[(afterIndex + 1) % vertexMarkers.length]
-        if (marker && nextMarker) {
-          const coord1 = marker.getLngLat()
-          const coord2 = nextMarker.getLngLat()
-          const midpoint = [(coord1.lng + coord2.lng) / 2, (coord1.lat + coord2.lat) / 2]
-          midpointMarker.setLngLat(midpoint)
-        }
-      })
-    }
-    
-    const deleteVertexAtIndex = (vertexIndex) => {
-      const vertexMarkers = neighborhoodRiskEditVertexMarkers.current.filter(m => m.getElement().dataset.type === 'vertex')
-      const currentCoordinates = vertexMarkers.map(m => {
-        const lngLat = m.getLngLat()
-        return [lngLat.lng, lngLat.lat]
-      })
-      currentCoordinates.splice(vertexIndex, 1)
-      const ring = [...currentCoordinates, currentCoordinates[0]]
-      const collection = getNeighborhoodRiskData()
-      const newCollection = {
-        ...collection,
-        features: collection.features.map(f => 
-          f.id === selectedNeighborhoodRiskPolygonId
-            ? { ...f, geometry: { ...f.geometry, coordinates: [ring] } }
-            : f
-        )
-      }
-      saveNeighborhoodRiskData(newCollection)
-      if (map.current.getSource('neighborhood-risk')) {
-        map.current.getSource('neighborhood-risk').setData(newCollection)
-      }
-      createMarkers()
-    }
-    
-    const addVertexAtIndex = (afterIndex, coordinates) => {
-      const vertexMarkers = neighborhoodRiskEditVertexMarkers.current.filter(m => m.getElement().dataset.type === 'vertex')
-      const currentCoordinates = vertexMarkers.map(m => {
-        const lngLat = m.getLngLat()
-        return [lngLat.lng, lngLat.lat]
-      })
-      currentCoordinates.splice(afterIndex + 1, 0, coordinates)
-      const ring = [...currentCoordinates, currentCoordinates[0]]
-      const collection = getNeighborhoodRiskData()
-      const newCollection = {
-        ...collection,
-        features: collection.features.map(f => 
-          f.id === selectedNeighborhoodRiskPolygonId
-            ? { ...f, geometry: { ...f.geometry, coordinates: [ring] } }
-            : f
-        )
-      }
-      saveNeighborhoodRiskData(newCollection)
-      if (map.current.getSource('neighborhood-risk')) {
-        map.current.getSource('neighborhood-risk').setData(newCollection)
-      }
-      createMarkers()
-    }
-    
-    const saveCurrentPolygon = () => {
-      const vertexMarkers = neighborhoodRiskEditVertexMarkers.current.filter(m => m.getElement().dataset.type === 'vertex')
-      const newCoordinates = vertexMarkers.map(m => {
-        const lngLat = m.getLngLat()
-        return [lngLat.lng, lngLat.lat]
-      })
-      const ring = [...newCoordinates, newCoordinates[0]]
-      const collection = getNeighborhoodRiskData()
-      const newCollection = {
-        ...collection,
-        features: collection.features.map(f => 
-          f.id === selectedNeighborhoodRiskPolygonId
-            ? { ...f, geometry: { ...f.geometry, coordinates: [ring] } }
-            : f
-        )
-      }
-      saveNeighborhoodRiskData(newCollection)
-      if (map.current.getSource('neighborhood-risk')) {
-        map.current.getSource('neighborhood-risk').setData(newCollection)
-      }
-    }
-    
-    const updatePolygonGeometry = () => {
-      const vertexMarkers = neighborhoodRiskEditVertexMarkers.current.filter(m => m.getElement().dataset.type === 'vertex')
-      const newCoordinates = vertexMarkers.map(m => {
-        const lngLat = m.getLngLat()
-        return [lngLat.lng, lngLat.lat]
-      })
-      const ring = [...newCoordinates, newCoordinates[0]]
-      const collection = getNeighborhoodRiskData()
-      const newCollection = {
-        ...collection,
-        features: collection.features.map(f => 
-          f.id === selectedNeighborhoodRiskPolygonId
-            ? { ...f, geometry: { ...f.geometry, coordinates: [ring] } }
-            : f
-        )
-      }
-      if (map.current.getSource('neighborhood-risk')) {
-        map.current.getSource('neighborhood-risk').setData(newCollection)
-      }
-    }
-    
-    createMarkers()
-    
-    return () => {
-      neighborhoodRiskEditVertexMarkers.current.forEach(marker => marker.remove())
-      neighborhoodRiskEditVertexMarkers.current = []
-    }
-  }, [neighborhoodRiskEditMode, selectedNeighborhoodRiskPolygonId, mapLoaded])
+  }, [deleteWaterMainId, stlNeighborhoodsGeojson])
 
   // Filter polygons by active risk levels
   useEffect(() => {
@@ -1311,12 +1270,6 @@ export default function MapView() {
         if (map.current.getLayer('pressure-zones-border')) {
           map.current.setFilter('pressure-zones-border', ['==', 'riskLevel', 'none'])
         }
-        if (map.current.getLayer('neighborhood-risk-fill')) {
-          map.current.setFilter('neighborhood-risk-fill', ['==', 'riskLevel', 'none'])
-        }
-        if (map.current.getLayer('neighborhood-risk-border')) {
-          map.current.setFilter('neighborhood-risk-border', ['==', 'riskLevel', 'none'])
-        }
       } else {
         // Show only selected risk levels
         console.log('🔍 Setting filter to show levels:', visibleLevels)
@@ -1326,12 +1279,6 @@ export default function MapView() {
         if (map.current.getLayer('pressure-zones-border')) {
           map.current.setFilter('pressure-zones-border', ['in', ['get', 'riskLevel'], ['literal', visibleLevels]])
         }
-        if (map.current.getLayer('neighborhood-risk-fill')) {
-          map.current.setFilter('neighborhood-risk-fill', ['in', ['get', 'riskLevel'], ['literal', visibleLevels]])
-        }
-        if (map.current.getLayer('neighborhood-risk-border')) {
-          map.current.setFilter('neighborhood-risk-border', ['in', ['get', 'riskLevel'], ['literal', visibleLevels]])
-        }
       }
     } catch (error) {
       console.error('❌ Error filtering pressure zones by risk level:', error)
@@ -1340,83 +1287,6 @@ export default function MapView() {
 
   // Meter visibility is now handled by the meter markers effect above
   // (markers are created/removed based on pressureSensorsVisible)
-
-  // Burst position management (localStorage)
-  const getBurstPositions = () => {
-    try {
-      const saved = localStorage.getItem('burstEventPositions')
-      return saved ? JSON.parse(saved) : {}
-    } catch (error) {
-      console.error('Error loading burst positions:', error)
-      return {}
-    }
-  }
-
-  const saveBurstPosition = (burstId, coordinates) => {
-    try {
-      const positions = getBurstPositions()
-      positions[burstId] = coordinates
-      localStorage.setItem('burstEventPositions', JSON.stringify(positions))
-      console.log(`✅ Saved burst position for ${burstId}:`, coordinates)
-    } catch (error) {
-      console.error('Error saving burst position:', error)
-    }
-  }
-
-  const getMergedBurstData = () => {
-    const savedPositions = getBurstPositions()
-    return {
-      ...BURST_EVENTS,
-      features: BURST_EVENTS.features.map(feature => {
-        const savedCoords = savedPositions[feature.id]
-        return savedCoords ? {
-          ...feature,
-          geometry: {
-            ...feature.geometry,
-            coordinates: savedCoords
-          }
-        } : feature
-      })
-    }
-  }
-
-  // Pressure zone polygon management (localStorage)
-  const getPressureZonePolygon = () => {
-    try {
-      const saved = localStorage.getItem('pressureZonePolygon')
-      return saved ? JSON.parse(saved) : null
-    } catch (error) {
-      console.error('Error loading pressure zone polygon:', error)
-      return null
-    }
-  }
-
-  const savePressureZonePolygon = (coordinates) => {
-    try {
-      localStorage.setItem('pressureZonePolygon', JSON.stringify(coordinates))
-      console.log('✅ Saved pressure zone polygon:', coordinates)
-    } catch (error) {
-      console.error('Error saving pressure zone polygon:', error)
-    }
-  }
-
-  const getMergedPressureZoneData = () => {
-    const savedPolygon = getPressureZonePolygon()
-    if (!savedPolygon) return PRESSURE_ZONES
-
-    return {
-      ...PRESSURE_ZONES,
-      features: PRESSURE_ZONES.features.map(feature => {
-        return {
-          ...feature,
-          geometry: {
-            ...feature.geometry,
-            coordinates: savedPolygon
-          }
-        }
-      })
-    }
-  }
 
   // Create/remove burst event markers (custom DOM with gradient glow)
   useEffect(() => {
@@ -1605,7 +1475,7 @@ export default function MapView() {
         centerMarker.on('dragend', () => {
           centerElement.style.cursor = 'grab'
           const lngLat = centerMarker.getLngLat()
-          saveBurstPosition(feature.id, [lngLat.lng, lngLat.lat])
+          setBurstPosition(feature.id, [lngLat.lng, lngLat.lat])
         })
       } else {
         // Normal mode: hover center marker only to show popup
@@ -2052,8 +1922,7 @@ export default function MapView() {
         // Close the polygon
         currentCoordinates.push(currentCoordinates[0])
         
-        // Save to localStorage
-        savePressureZonePolygon([currentCoordinates])
+        setPressureZonePolygonCoords([currentCoordinates])
         
         // Update the map source
         if (map.current.getSource('pressure-zones')) {
@@ -2094,8 +1963,7 @@ export default function MapView() {
         // Close the polygon
         currentCoordinates.push(currentCoordinates[0])
         
-        // Save to localStorage
-        savePressureZonePolygon([currentCoordinates])
+        setPressureZonePolygonCoords([currentCoordinates])
         
         // Update the map source
         if (map.current.getSource('pressure-zones')) {
@@ -2133,8 +2001,7 @@ export default function MapView() {
         // Close the polygon by adding the first coordinate at the end
         newCoordinates.push(newCoordinates[0])
         
-        // Save to localStorage
-        savePressureZonePolygon([newCoordinates])
+        setPressureZonePolygonCoords([newCoordinates])
         
         // Update the map source
         const mergedData = getMergedPressureZoneData()
@@ -2169,6 +2036,8 @@ export default function MapView() {
         // Close the polygon
         newCoordinates.push(newCoordinates[0])
         
+        setPressureZonePolygonCoords([newCoordinates])
+        
         // Update the map source
         const mergedData = getMergedPressureZoneData()
         if (map.current.getSource('pressure-zones')) {
@@ -2189,11 +2058,12 @@ export default function MapView() {
       // Initial marker creation
       createMarkers()
     } else {
-      // When exiting edit mode, update source with saved polygon
+      // When not editing, keep source synced to unified STL-neighborhood zone if available.
       if (map.current.getSource('pressure-zones')) {
-        const mergedData = getMergedPressureZoneData()
-        map.current.getSource('pressure-zones').setData(mergedData)
-        console.log('✅ Pressure zone polygon updated from localStorage')
+        const unifiedZoneData = buildUnifiedPressureZoneFromNeighborhoods(stlNeighborhoodsGeojson)
+        const data = unifiedZoneData || getMergedPressureZoneData()
+        map.current.getSource('pressure-zones').setData(data)
+        console.log('✅ Pressure zone polygon synced from unified STL geometry')
       }
     }
     
@@ -2201,7 +2071,7 @@ export default function MapView() {
       polygonVertexMarkers.current.forEach(marker => marker.remove())
       polygonVertexMarkers.current = []
     }
-  }, [pressureZoneEditMode, mapLoaded])
+  }, [pressureZoneEditMode, mapLoaded, stlNeighborhoodsGeojson])
 
   // Filter network meters by active statuses (now working with DOM markers)
   useEffect(() => {
@@ -2235,58 +2105,22 @@ export default function MapView() {
   // Handle network meter position updates
   const handleSensorPositionUpdate = (sensorId, newCoordinates) => {
     console.log(`📍 Updating meter ${sensorId} to:`, newCoordinates)
-    
     try {
-      // Get existing saved positions from localStorage
-      const savedPositions = JSON.parse(localStorage.getItem('sensorPositions') || '{}')
-      
-      // Update the position
-      savedPositions[sensorId] = {
-        coordinates: newCoordinates,
-        timestamp: new Date().toISOString()
-      }
-      
-      // Save to localStorage
-      localStorage.setItem('sensorPositions', JSON.stringify(savedPositions))
-      
-      console.log('✅ Meter position saved to localStorage')
-      console.log('💾 To export all positions, run: exportSensorPositions()')
-      
-      // Make export function available globally for easy access
+      setNetworkMeterPosition(sensorId, newCoordinates)
+      console.log('✅ Meter position updated (session only; not persisted across reload)')
+      console.log('💾 To export current positions into code, run: exportSensorPositions()')
       window.exportSensorPositions = () => {
-        const positions = JSON.parse(localStorage.getItem('sensorPositions') || '{}')
-        const updatedSensors = { ...PRESSURE_SENSORS }
-        
-        // Update coordinates in the feature collection
-        updatedSensors.features = updatedSensors.features.map(feature => {
-          if (positions[feature.id]) {
-            return {
-              ...feature,
-              geometry: {
-                ...feature.geometry,
-                coordinates: positions[feature.id].coordinates
-              }
-            }
-          }
-          return feature
-        })
-        
-        // Generate exportable JavaScript code
+        const merged = getMergedSensorData()
         const exportCode = `        // Updated network meter positions - ${new Date().toISOString()}
-export const PRESSURE_SENSORS = ${JSON.stringify(updatedSensors, null, 2)}`
-        
+export const PRESSURE_SENSORS = ${JSON.stringify(merged, null, 2)}`
         console.log('\n📤 COPY THE CODE BELOW AND PASTE INTO src/data/pressureSensors.js (Network Meters):\n')
         console.log(exportCode)
-        console.log('\n📋 Code also copied to clipboard!')
-        
-        // Try to copy to clipboard
         navigator.clipboard.writeText(exportCode).then(() => {
           console.log('✅ Copied to clipboard!')
-        }).catch(err => {
+        }).catch(() => {
           console.log('⚠️ Could not copy to clipboard, please copy from console')
         })
       }
-      
     } catch (error) {
       console.error('❌ Error saving meter position:', error)
     }
@@ -2294,12 +2128,7 @@ export const PRESSURE_SENSORS = ${JSON.stringify(updatedSensors, null, 2)}`
 
   const handlePressureSensorPositionUpdate = (sensorId, newCoordinates) => {
     try {
-      const savedPositions = JSON.parse(localStorage.getItem('pressureSensorPositions') || '{}')
-      savedPositions[sensorId] = {
-        coordinates: newCoordinates,
-        timestamp: new Date().toISOString(),
-      }
-      localStorage.setItem('pressureSensorPositions', JSON.stringify(savedPositions))
+      setPressureGaugePosition(sensorId, newCoordinates)
     } catch (error) {
       console.error('Error saving pressure sensor position:', error)
     }

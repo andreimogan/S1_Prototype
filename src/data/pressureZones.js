@@ -1,5 +1,6 @@
-// Test Pressure Zone - Simple Synthetic Polygon
-// Coordinates are in [longitude, latitude] format
+// Pressure zone polygon(s) shipped with the app.
+// To capture edits from the map: console → exportPressureZonesToSource() → replace this file’s export.
+// Coordinates are [longitude, latitude].
 
 export const PRESSURE_ZONES = {
   type: 'FeatureCollection',

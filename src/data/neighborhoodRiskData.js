@@ -1,29 +1,16 @@
-const STORAGE_KEY = 'neighborhoodRiskPolygons'
-
-const EMPTY_COLLECTION = {
+/** Legacy placeholder — custom neighborhood risk polygons are no longer used. */
+export const NEIGHBORHOOD_RISK_DEFAULT = {
   type: 'FeatureCollection',
-  features: []
+  features: [],
 }
+
+let sessionNeighborhoodRisk = null
 
 export function getNeighborhoodRiskData() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return EMPTY_COLLECTION
-    const parsed = JSON.parse(raw)
-    if (parsed && parsed.type === 'FeatureCollection' && Array.isArray(parsed.features)) {
-      return parsed
-    }
-    return EMPTY_COLLECTION
-  } catch (error) {
-    console.error('Error loading neighborhood risk polygons:', error)
-    return EMPTY_COLLECTION
-  }
+  return sessionNeighborhoodRisk ?? NEIGHBORHOOD_RISK_DEFAULT
 }
 
+/** Session-only; not persisted across reloads. */
 export function saveNeighborhoodRiskData(featureCollection) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(featureCollection))
-  } catch (error) {
-    console.error('Error saving neighborhood risk polygons:', error)
-  }
+  sessionNeighborhoodRisk = featureCollection
 }

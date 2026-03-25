@@ -1,5 +1,6 @@
-import { createContext, useContext, useState } from 'react'
+import { createContext, useContext, useState, useEffect } from 'react'
 import { sendChatMessage } from '../services/openai-chat'
+import { fetchStlNeighborhoodsData } from '../data/stlNeighborhoods'
 
 const PanelContext = createContext()
 
@@ -106,45 +107,61 @@ export const PanelProvider = ({ children }) => {
   // Pressure zone editing mode
   const [pressureZoneEditMode, setPressureZoneEditMode] = useState(false)
   
-  // Neighborhood risk layer and draw mode
+  // Neighborhoods | Risk: custom polygons + St. Louis ArcGIS boundaries (single layer toggle)
   const [neighborhoodsRiskVisible, setNeighborhoodsRiskVisible] = useState(false)
-  const [neighborhoodRiskDrawMode, setNeighborhoodRiskDrawMode] = useState(false)
-  const [neighborhoodRiskDrawLevel, setNeighborhoodRiskDrawLevel] = useState('high')
-  const [completeNeighborhoodRiskPolygonRequest, setCompleteNeighborhoodRiskPolygonRequest] = useState(0)
-  const [neighborhoodDrawPointCount, setNeighborhoodDrawPointCount] = useState(0)
-  const [neighborhoodRiskEditMode, setNeighborhoodRiskEditMode] = useState(false)
-  const [selectedNeighborhoodRiskPolygonId, setSelectedNeighborhoodRiskPolygonId] = useState(null)
-  const [deleteNeighborhoodRiskPolygonId, setDeleteNeighborhoodRiskPolygonId] = useState(null)
-  
-  const requestCompleteNeighborhoodRiskPolygon = () => {
-    setCompleteNeighborhoodRiskPolygonRequest((n) => n + 1)
-  }
-  
-  const requestDeleteNeighborhoodRiskPolygon = (polygonId) => {
-    setDeleteNeighborhoodRiskPolygonId(polygonId)
-  }
-  
-  // Burst gradient parameters
-  const [burstGradientParams, setBurstGradientParams] = useState(() => {
-    try {
-      const saved = localStorage.getItem('burstGradientParams')
-      return saved ? JSON.parse(saved) : {
-        size: 280,
-        opacity: 0.35,
-        spread: 60
-      }
-    } catch {
-      return {
-        size: 280,
-        opacity: 0.35,
-        spread: 60
-      }
+  /** St. Louis outline per hood: `false` = hidden; missing / `true` = shown */
+  const [enabledStlNeighborhoodIds, setEnabledStlNeighborhoodIds] = useState({})
+
+  /** One app-wide load: ArcGIS GeoJSON + list for the panel (no duplicate MapView/panel fetches). */
+  const [stlNeighborhoodsLoadStatus, setStlNeighborhoodsLoadStatus] = useState('loading')
+  const [stlNeighborhoodsGeojson, setStlNeighborhoodsGeojson] = useState(null)
+  const [stlNeighborhoodList, setStlNeighborhoodList] = useState([])
+
+  useEffect(() => {
+    let cancelled = false
+    setStlNeighborhoodsLoadStatus('loading')
+    fetchStlNeighborhoodsData()
+      .then(({ geojson, neighborhoods }) => {
+        if (cancelled) return
+        setStlNeighborhoodsGeojson(geojson)
+        setStlNeighborhoodList(neighborhoods)
+        setStlNeighborhoodsLoadStatus('ready')
+      })
+      .catch((err) => {
+        if (cancelled) return
+        console.error('St. Louis neighborhoods failed to load:', err)
+        setStlNeighborhoodsLoadStatus('error')
+      })
+    return () => {
+      cancelled = true
     }
+  }, [])
+
+  /** Main Neighborhoods | Risk off → every St. Louis sub-toggle off; main on → all on (`{}`). */
+  useEffect(() => {
+    if (stlNeighborhoodList.length === 0) return
+    if (!neighborhoodsRiskVisible) {
+      setEnabledStlNeighborhoodIds(() => {
+        const next = {}
+        stlNeighborhoodList.forEach(({ id }) => {
+          next[id] = false
+        })
+        return next
+      })
+    } else {
+      setEnabledStlNeighborhoodIds({})
+    }
+  }, [neighborhoodsRiskVisible, stlNeighborhoodList])
+  
+  // Burst gradient parameters (session only; not persisted across reload)
+  const [burstGradientParams, setBurstGradientParams] = useState({
+    size: 280,
+    opacity: 0.35,
+    spread: 60,
   })
   
   const updateBurstGradientParams = (params) => {
     setBurstGradientParams(params)
-    localStorage.setItem('burstGradientParams', JSON.stringify(params))
   }
   
   // Selected pressure zone for detail panel
@@ -376,20 +393,11 @@ export const PanelProvider = ({ children }) => {
     setPressureZoneEditMode,
     neighborhoodsRiskVisible,
     setNeighborhoodsRiskVisible,
-    neighborhoodRiskDrawMode,
-    setNeighborhoodRiskDrawMode,
-    neighborhoodRiskDrawLevel,
-    setNeighborhoodRiskDrawLevel,
-    completeNeighborhoodRiskPolygonRequest,
-    requestCompleteNeighborhoodRiskPolygon,
-    neighborhoodDrawPointCount,
-    setNeighborhoodDrawPointCount,
-    neighborhoodRiskEditMode,
-    setNeighborhoodRiskEditMode,
-    selectedNeighborhoodRiskPolygonId,
-    setSelectedNeighborhoodRiskPolygonId,
-    deleteNeighborhoodRiskPolygonId,
-    requestDeleteNeighborhoodRiskPolygon,
+    enabledStlNeighborhoodIds,
+    setEnabledStlNeighborhoodIds,
+    stlNeighborhoodsLoadStatus,
+    stlNeighborhoodsGeojson,
+    stlNeighborhoodList,
     burstGradientParams,
     updateBurstGradientParams,
     selectedSensor,
